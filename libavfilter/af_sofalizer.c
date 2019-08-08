@@ -35,6 +35,7 @@
 #include "libavutil/intmath.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "internal.h"
 #include "audio.h"
 
@@ -81,6 +82,7 @@ typedef struct SOFAlizerContext {
     int buffer_length;          /* is: longest IR plus max. delay in all SOFA files */
                                 /* then choose next power of 2 */
     int n_fft;                  /* number of samples in one FFT block */
+    int nb_samples;
 
                                 /* netCDF variables */
     int *delay[2];              /* broadband delay for each channel/IR to be convolved */
@@ -588,7 +590,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     if (s->type == TIME_DOMAIN) {
         ctx->internal->execute(ctx, sofalizer_convolute, &td, NULL, 2);
-    } else {
+    } else if (s->type == FREQUENCY_DOMAIN) {
         ctx->internal->execute(ctx, sofalizer_fast_convolute, &td, NULL, 2);
     }
     emms_c();
@@ -601,6 +603,31 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
+}
+
+static int activate(AVFilterContext *ctx)
+{
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    SOFAlizerContext *s = ctx->priv;
+    AVFrame *in;
+    int ret;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    if (s->nb_samples)
+        ret = ff_inlink_consume_samples(inlink, s->nb_samples, s->nb_samples, &in);
+    else
+        ret = ff_inlink_consume_frame(inlink, &in);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return filter_frame(inlink, in);
+
+    FF_FILTER_FORWARD_STATUS(inlink, outlink);
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+
+    return FFERROR_NOT_READY;
 }
 
 static int query_formats(AVFilterContext *ctx)
@@ -719,12 +746,20 @@ static int load_data(AVFilterContext *ctx, int azim, int elev, float radius, int
     n_samples = s->sofa.n_samples;
     ir_samples = s->sofa.ir_samples;
 
-    s->data_ir[0] = av_calloc(n_samples, sizeof(float) * s->n_conv);
-    s->data_ir[1] = av_calloc(n_samples, sizeof(float) * s->n_conv);
+    if (s->type == TIME_DOMAIN) {
+        s->data_ir[0] = av_calloc(n_samples, sizeof(float) * s->n_conv);
+        s->data_ir[1] = av_calloc(n_samples, sizeof(float) * s->n_conv);
+
+        if (!s->data_ir[0] || !s->data_ir[1]) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
     s->delay[0] = av_calloc(s->n_conv, sizeof(int));
     s->delay[1] = av_calloc(s->n_conv, sizeof(int));
 
-    if (!s->data_ir[0] || !s->data_ir[1] || !s->delay[0] || !s->delay[1]) {
+    if (!s->delay[0] || !s->delay[1]) {
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -817,7 +852,7 @@ static int load_data(AVFilterContext *ctx, int azim, int elev, float radius, int
     if (s->type == TIME_DOMAIN) {
         s->ringbuffer[0] = av_calloc(s->buffer_length, sizeof(float) * nb_input_channels);
         s->ringbuffer[1] = av_calloc(s->buffer_length, sizeof(float) * nb_input_channels);
-    } else {
+    } else if (s->type == FREQUENCY_DOMAIN) {
         /* get temporary HRTF memory for L and R channel */
         data_hrtf_l = av_malloc_array(n_fft, sizeof(*data_hrtf_l) * n_conv);
         data_hrtf_r = av_malloc_array(n_fft, sizeof(*data_hrtf_r) * n_conv);
@@ -868,7 +903,7 @@ static int load_data(AVFilterContext *ctx, int azim, int elev, float radius, int
                 s->data_ir[0][offset + j] = lir[ir_samples - 1 - j] * gain_lin;
                 s->data_ir[1][offset + j] = rir[ir_samples - 1 - j] * gain_lin;
             }
-        } else {
+        } else if (s->type == FREQUENCY_DOMAIN) {
             memset(fft_in_l, 0, n_fft * sizeof(*fft_in_l));
             memset(fft_in_r, 0, n_fft * sizeof(*fft_in_r));
 
@@ -956,11 +991,8 @@ static int config_input(AVFilterLink *inlink)
     SOFAlizerContext *s = ctx->priv;
     int ret;
 
-    if (s->type == FREQUENCY_DOMAIN) {
-        inlink->partial_buf_size =
-        inlink->min_samples =
-        inlink->max_samples = s->framesize;
-    }
+    if (s->type == FREQUENCY_DOMAIN)
+        s->nb_samples = s->framesize;
 
     /* gain -3 dB per channel */
     s->gain_lfe = expf((s->gain - 3 * inlink->channels + s->lfe_gain) / 20 * M_LN10);
@@ -1039,7 +1071,6 @@ static const AVFilterPad inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_AUDIO,
         .config_props = config_input,
-        .filter_frame = filter_frame,
     },
     { NULL }
 };
@@ -1058,6 +1089,7 @@ AVFilter ff_af_sofalizer = {
     .priv_size     = sizeof(SOFAlizerContext),
     .priv_class    = &sofalizer_class,
     .init          = init,
+    .activate      = activate,
     .uninit        = uninit,
     .query_formats = query_formats,
     .inputs        = inputs,
